@@ -1,0 +1,76 @@
+# Config for XLSR-300M-Phoneme-Recognition (run inside that repo) to fine-tune XLS-R-300M for
+# phoneme recognition on the APL training split only. Paths are filled from the CLI:
+#   python scripts/train.py --config <apl-mdd>/configs/xlsr_finetune.yaml \
+#       --train_csv xlsr_ft_data/train.csv --dev_csv xlsr_ft_data/dev.csv \
+#       --vocab_path xlsr_ft_data/vocab.json --output_dir runs/apl_ft
+#
+# Same recipe as that repo's server_4090.yaml (tri-stage LR, head-only warm start, SpecAugment),
+# with the step budget scaled to ~7.3 h of training audio (~165 updates/epoch at 160 s/batch,
+# 10k updates ~= 60 epochs). Shared lab GPU: 50% of VRAM and 50% of GPU time.
+
+data:
+  train_csv: null
+  dev_csv: null
+  vocab_path: null
+  domains: null
+  path_map: []
+  cache_dir: cache
+  sample_rate: 16000
+  min_audio_seconds: 0.3
+  max_audio_seconds: 30.0
+  blank_token: "[PAD]"
+  unk_token: "[UNK]"
+  train_unk_policy: keep
+
+model:
+  pretrained_name: facebook/wav2vec2-xls-r-300m
+  freeze_feature_encoder: true
+  freeze_transformer_steps: 1000
+  gradient_checkpointing: true
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  activation_dropout: 0.05
+  feat_proj_dropout: 0.05
+  final_dropout: 0.1
+  layerdrop: 0.05
+  mask_time_prob: 0.25
+  mask_time_length: 10
+  mask_feature_prob: 0.05
+  mask_feature_length: 64
+  ctc_reduction: mean
+
+train:
+  output_dir: runs/apl_ft
+  seed: 42
+  max_steps: 10000
+  max_epochs: 1000
+  max_batch_seconds: 160.0
+  max_batch_size: 64
+  grad_accum_steps: 1
+  lr: 5.0e-5
+  head_lr: 5.0e-4
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-8
+  scheduler: tri_stage
+  warmup_steps: 1000
+  tri_stage_hold_ratio: 0.4
+  final_lr_scale: 0.05
+  max_grad_norm: 1.0
+  precision: bf16
+  allow_tf32: true
+  domain_weights: []
+  num_workers: 6
+  bucket_size_multiplier: 100
+  gpu_memory_fraction: 0.5
+  gpu_duty_pct: 50
+
+eval:
+  log_every: 50
+  eval_every: 500
+  eval_max_batch_seconds: 300.0
+  select_metric: per/ALL      # dev = the 6 APL dev speakers (L2-ARCTIC only)
+  save_top_k: 1
+  early_stopping_patience: 8
+  resume_from: null

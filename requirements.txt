@@ -1,0 +1,10 @@
+# Install the CUDA build of PyTorch first, e.g.
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.1
+torchaudio>=2.1
+transformers>=4.40
+soundfile>=0.12   # libsndfile reads wav / flac / NIST SPHERE (TIMIT)
+numpy
+pandas
+pyyaml
+pytest

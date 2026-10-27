@@ -1,0 +1,42 @@
+# APL training config. Every key can be overridden on the CLI of scripts/train.py (--key value).
+# Values marked [APL] are stated in the paper; [14] = taken from the released code of the
+# baseline the paper reuses (github.com/cageyoko/CTC-Attention-Mispronunciation).
+
+# ---------------------------------------------------------------- data
+data_dir: data
+vocab: configs/vocab.json
+fbank_dir: feats/fbank           # scripts/extract_fbank.py
+phon_dir: null                   # scripts/extract_xlsr.py output, required for P / PL / APL
+
+# ---------------------------------------------------------------- model
+variant: APL                     # APL | PL | AL | P
+model:
+  acoustic_dim: 81               # [APL] 80 fbank + 1 energy
+  conv_channels: [32, 32]        # [14]
+  conv_kernels: [[3, 3], [3, 3]] # [14]
+  conv_strides: [[1, 2], [2, 2]] # [14] (time, freq)
+  conv_paddings: [[1, 1], [1, 1]]
+  rnn_hidden: 384                # [14] per direction
+  acoustic_rnn_layers: 4         # [APL]
+  phonetic_rnn_layers: 1         # [APL]
+  embed_dim: 512                 # [14]
+  dropout: 0.2                   # [14]
+
+# ---------------------------------------------------------------- training
+batch_size: 64                   # [APL]
+max_epochs: 200                  # [APL]
+lr: 0.001                        # [14] Adam
+weight_decay: 0.0005             # [14]
+lr_decay: 0.5                    # [14] halve when dev loss stops improving
+plateau_threshold: 2.0           # [14] end_adjust_acc
+plateau_patience: 10             # [14]
+max_lr_decays: 8                 # [14] stop after 8 halvings
+beam: 10                         # [14] beam search width, no LM
+seed: 42
+amp: bf16                        # bf16 autocast on GPU (numerics only); "none" for fp32
+num_workers: 6
+
+# ---------------------------------------------------------------- shared lab GPU
+gpu_memory_fraction: 0.5         # VRAM cap for this process (0 = no cap); exceeding it raises OOM
+gpu_duty_pct: 50                 # GPU busy at most this % of wall time (100 = no throttling)
+out_dir: runs/APL
