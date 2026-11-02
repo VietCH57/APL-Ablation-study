@@ -21,8 +21,9 @@ def limit_gpu_memory(fraction: float, device: torch.device) -> None:
     if not 0.0 <= fraction <= 1.0:
         raise ValueError("gpu_memory_fraction must be in [0, 1]")
     if fraction and device.type == "cuda":
-        torch.cuda.set_per_process_memory_fraction(fraction, device)
-        total = torch.cuda.get_device_properties(device).total_memory / 2**30
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        torch.cuda.set_per_process_memory_fraction(fraction, idx)
+        total = torch.cuda.get_device_properties(idx).total_memory / 2**30
         logger.info("GPU memory capped at %.0f%% (%.1f of %.1f GiB)", 100 * fraction, fraction * total, total)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 from contextlib import nullcontext
@@ -75,6 +76,56 @@ def to_device(batch: Dict, device: torch.device) -> Dict:
     return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 
+class FrameBudget:
+    """Largest batch_size x max_frames processed in one forward pass.
+
+    A batch of `batch_size` utterances that does not fit in GPU memory is cut into k consecutive
+    chunks (the batch is length-sorted, so chunks have similar lengths); the gradients of the
+    chunks are accumulated and one optimizer step is taken per batch, so the update is that of the
+    full batch except that BatchNorm statistics are computed per chunk. The budget starts at
+    `initial` (0 = unlimited) and is halved whenever a chunk runs out of memory.
+    """
+
+    def __init__(self, initial: int = 0):
+        self.value = initial if initial and initial > 0 else None
+
+    def splits(self, batch: Dict) -> int:
+        n = len(batch["lengths"])
+        if self.value is None:
+            return 1
+        frames = n * int(batch["lengths"].max())
+        return max(1, min(n, math.ceil(frames / self.value)))
+
+    def shrink(self, batch: Dict, k: int) -> None:
+        frames = len(batch["lengths"]) * int(batch["lengths"].max())
+        self.value = max(1, frames // (2 * k))
+
+
+def split_batch(batch: Dict, k: int) -> List[Dict]:
+    """Cut a collated batch into k consecutive chunks, trimming padding to each chunk's length."""
+    n = len(batch["lengths"])
+    if k <= 1:
+        return [batch]
+    size = math.ceil(n / k)
+    tgt_ends = torch.cumsum(batch["target_lengths"], 0)
+    chunks = []
+    for s in range(0, n, size):
+        e = min(n, s + size)
+        t_max = int(batch["lengths"][s:e].max())
+        c_max = int(batch["canonical_lengths"][s:e].max())
+        t0 = 0 if s == 0 else int(tgt_ends[s - 1])
+        t1 = int(tgt_ends[e - 1])
+        ch = {"lengths": batch["lengths"][s:e], "utt_ids": batch["utt_ids"][s:e],
+              "indices": batch["indices"][s:e], "canonical": batch["canonical"][s:e, :c_max],
+              "canonical_lengths": batch["canonical_lengths"][s:e], "targets": batch["targets"][t0:t1],
+              "target_lengths": batch["target_lengths"][s:e]}
+        for key in ("fbank", "phonetic"):
+            if key in batch:
+                ch[key] = batch[key][s:e, :t_max]
+        chunks.append(ch)
+    return chunks
+
+
 def autocast(device: torch.device, amp: str):
     if amp == "bf16" and device.type == "cuda":
         return torch.autocast("cuda", dtype=torch.bfloat16)
@@ -86,30 +137,87 @@ def forward(model: APLModel, batch: Dict, return_attention: bool = False) -> Dic
                  batch.get("canonical_lengths"), return_attention=return_attention)
 
 
+def train_step(model: APLModel, batch: Dict, optimizer, vocab: Vocab, device, amp: str,
+               budget: FrameBudget) -> float:
+    """One optimizer step on one batch (split into chunks if it does not fit in memory).
+    Returns the batch loss: summed CTC loss / batch size, as in [14]."""
+    n = len(batch["lengths"])
+    while True:
+        k = budget.splits(batch)
+        oom = False
+        optimizer.zero_grad(set_to_none=True)
+        total = 0.0
+        try:
+            for ch in split_batch(batch, k):
+                ch = to_device(ch, device)
+                with autocast(device, amp):
+                    out = forward(model, ch)
+                loss = ctc_loss(out, ch["targets"], ch["target_lengths"], vocab.blank_id, batch_size=n)
+                loss.backward()
+                total += loss.item()
+                del out, loss, ch
+        except torch.cuda.OutOfMemoryError:
+            if k >= n:
+                raise
+            oom = True
+        if not oom:
+            optimizer.step()
+            return total
+        # cleanup outside the except block so the traceback does not keep tensors alive
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        budget.shrink(batch, k)
+        logger.warning("CUDA OOM on a batch of %d x %d frames in %d chunk(s); budget -> %d frames, retrying",
+                       n, int(batch["lengths"].max()), k, budget.value)
+
+
 @torch.no_grad()
 def run_eval(model: APLModel, loader, vocab: Vocab, device, amp: str, beam: int = 0,
-             duty: Optional[DutyCycle] = None) -> Dict:
+             duty: Optional[DutyCycle] = None, budget: Optional[FrameBudget] = None) -> Dict:
     """Loss + decoding of a whole split. beam=0 -> greedy."""
     duty = duty or NoDuty()
+    budget = budget or FrameBudget()
     model.eval()
     ds = loader.dataset
     total_loss, n_batches = 0.0, 0
     preds: Dict[int, List[int]] = {}
     for batch in loader:
         duty.start()
-        batch = to_device(batch, device)
-        with autocast(device, amp):
-            out = forward(model, batch)
-        total_loss += ctc_loss(out, batch["targets"], batch["target_lengths"], vocab.blank_id).item()
+        n = len(batch["lengths"])
+        while True:
+            k = budget.splits(batch)
+            outs, loss_sum, oom = [], 0.0, False
+            try:
+                for ch in split_batch(batch, k):
+                    ch = to_device(ch, device)
+                    with autocast(device, amp):
+                        out = forward(model, ch)
+                    loss_sum += ctc_loss(out, ch["targets"], ch["target_lengths"], vocab.blank_id,
+                                         batch_size=n).item()
+                    outs.append((ch["indices"], out["log_probs"].float().cpu(), out["output_lengths"].cpu()))
+                    del out, ch
+            except torch.cuda.OutOfMemoryError:
+                if k >= n:
+                    raise
+                oom = True
+            if not oom:
+                break
+            outs = []
+            torch.cuda.empty_cache()
+            budget.shrink(batch, k)
+            logger.warning("CUDA OOM in evaluation (%d x %d frames); budget -> %d frames, retrying",
+                           n, int(batch["lengths"].max()), budget.value)
+        total_loss += loss_sum
         n_batches += 1
         duty.stop()  # GPU work of this batch ends here; decoding below runs on the CPU
-        if beam > 0:
-            hyps = beam_decode(out["log_probs"], out["output_lengths"], vocab.blank_id, beam)
-        else:
-            hyps = greedy_decode(out["log_probs"], out["output_lengths"], vocab.blank_id)
+        for idx, lp, ol in outs:
+            if beam > 0:
+                hyps = beam_decode(lp, ol, vocab.blank_id, beam)
+            else:
+                hyps = greedy_decode(lp, ol, vocab.blank_id)
+            for i, h in zip(idx.tolist(), hyps):
+                preds[i] = h
         duty.throttle()
-        for idx, h in zip(batch["indices"].tolist(), hyps):
-            preds[idx] = h
     order = sorted(preds)
     canon = [ds.utts[i].canonical for i in order]
     human = [ds.utts[i].transcript for i in order]

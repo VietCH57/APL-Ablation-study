@@ -285,9 +285,10 @@ class APLModel(nn.Module):
 
 
 def ctc_loss(out: Dict[str, torch.Tensor], targets: torch.Tensor, target_lengths: torch.Tensor,
-             blank: int) -> torch.Tensor:
-    """Summed CTC loss divided by the batch size, as in [14] (CTCLoss(reduction='sum') / batch)."""
+             blank: int, batch_size: Optional[int] = None) -> torch.Tensor:
+    """Summed CTC loss divided by the batch size, as in [14] (CTCLoss(reduction='sum') / batch).
+    `batch_size` is the size of the full batch when `out` covers only one chunk of it."""
     lp = out["log_probs"].transpose(0, 1)  # (T', B, C)
     loss = F.ctc_loss(lp, targets, out["output_lengths"], target_lengths, blank=blank, reduction="sum",
                       zero_infinity=True)
-    return loss / lp.size(1)
+    return loss / (batch_size or lp.size(1))

@@ -26,12 +26,12 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from apl.engine import (autocast, build_dataset, forward, load_checkpoint, logger, make_loader,  # noqa: E402
-                        phonetic_dim, run_eval, save_checkpoint, set_seed, setup_logging, to_device,
+from apl.engine import (FrameBudget, build_dataset, load_checkpoint, logger, make_loader,  # noqa: E402
+                        phonetic_dim, run_eval, save_checkpoint, set_seed, setup_logging, train_step,
                         variant_flags)
 from apl.gpu import DutyCycle, limit_gpu_memory  # noqa: E402
 from apl.metrics import format_table_row  # noqa: E402
-from apl.model import APLConfig, APLModel, ctc_loss  # noqa: E402
+from apl.model import APLConfig, APLModel  # noqa: E402
 from apl.vocab import Vocab  # noqa: E402
 
 
@@ -58,23 +58,24 @@ def parse_args():
     return cfg
 
 
-def train_epoch(model, loader, sampler, optimizer, vocab, device, amp, epoch, duty):
+def train_epoch(model, loader, sampler, optimizer, vocab, device, amp, epoch, duty, budget):
     model.train()
     sampler.set_epoch(epoch)
     total, n = 0.0, 0
     for batch in loader:
         duty.start()
-        batch = to_device(batch, device)
-        with autocast(device, amp):
-            out = forward(model, batch)
-        loss = ctc_loss(out, batch["targets"], batch["target_lengths"], vocab.blank_id)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        total += loss.item()
+        total += train_step(model, batch, optimizer, vocab, device, amp, budget)
         n += 1
         duty.step()
     return total / max(n, 1)
+
+
+def peak_mem_gb(device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    peak = torch.cuda.max_memory_allocated(device) / 2**30
+    torch.cuda.reset_peak_memory_stats(device)
+    return peak
 
 
 def main():
@@ -88,6 +89,7 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
     limit_gpu_memory(cfg["gpu_memory_fraction"], device)
     duty = DutyCycle(cfg["gpu_duty_pct"], device)
+    budget = FrameBudget(cfg.get("max_batch_frames", 0))
 
     flags = variant_flags(cfg["variant"])
     if flags["use_phonetic"] and not cfg.get("phon_dir"):
@@ -128,8 +130,9 @@ def main():
     history = []
     t0 = time.time()
     for epoch in range(1, cfg["max_epochs"] + 1):
-        tr_loss = train_epoch(model, train_loader, train_sampler, optimizer, vocab, device, cfg["amp"], epoch, duty)
-        dev = run_eval(model, dev_loader, vocab, device, cfg["amp"], beam=0, duty=duty)
+        tr_loss = train_epoch(model, train_loader, train_sampler, optimizer, vocab, device, cfg["amp"], epoch, duty,
+                               budget)
+        dev = run_eval(model, dev_loader, vocab, device, cfg["amp"], beam=0, duty=duty, budget=budget)
         dev_loss, dev_acc = dev["loss"], 1.0 - dev["PER"]
 
         thr = cfg["plateau_threshold"]
@@ -152,9 +155,9 @@ def main():
 
         history.append({"epoch": epoch, "lr": lr, "train_loss": tr_loss, "dev_loss": dev_loss,
                         "dev_PER": dev["PER"], "dev_f1": dev["f1"]})
-        logger.info("epoch %3d | lr %.2e | train %.3f | dev loss %.3f PER %.2f%% F1 %.2f%% | plateau %d%s | %.1f min",
-                    epoch, lr, tr_loss, dev_loss, 100 * dev["PER"], 100 * dev["f1"], counter,
-                    " *best*" if improved else "", (time.time() - t0) / 60)
+        logger.info("epoch %3d | lr %.2e | train %.3f | dev loss %.3f PER %.2f%% F1 %.2f%% | plateau %d%s | "
+                    "%.1f min | peak %.1f GiB", epoch, lr, tr_loss, dev_loss, 100 * dev["PER"], 100 * dev["f1"],
+                    counter, " *best*" if improved else "", (time.time() - t0) / 60, peak_mem_gb(device))
 
         if counter >= cfg["plateau_patience"]:
             decays += 1
@@ -175,7 +178,7 @@ def main():
     # ---------------------------------------------------------- final decoding with the selected model
     model = load_checkpoint(os.path.join(out_dir, "best.pt")).to(device)
     for split, loader in (("dev", dev_loader), ("test", test_loader)):
-        res = run_eval(model, loader, vocab, device, cfg["amp"], beam=cfg["beam"], duty=duty)
+        res = run_eval(model, loader, vocab, device, cfg["amp"], beam=cfg["beam"], duty=duty, budget=budget)
         rows = res.pop("_rows")
         with open(os.path.join(out_dir, f"{split}_decoded.jsonl"), "w") as f:
             for r in rows:

@@ -39,4 +39,7 @@ num_workers: 6
 # ---------------------------------------------------------------- shared lab GPU
 gpu_memory_fraction: 0.5         # VRAM cap for this process (0 = no cap); exceeding it raises OOM
 gpu_duty_pct: 50                 # GPU busy at most this % of wall time (100 = no throttling)
+max_batch_frames: 0              # max utts x frames per forward pass; larger batches are split into chunks
+                                 # with gradient accumulation (one step per batch of 64). 0 = no limit;
+                                 # the limit is also lowered automatically after a CUDA out-of-memory error
 out_dir: runs/APL
