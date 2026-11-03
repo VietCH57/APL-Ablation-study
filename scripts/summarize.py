@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from apl.metrics import TABLE_KEYS  # noqa: E402
 
-ORDER = ["AL", "P-raw", "PL-raw", "APL-raw", "P-ft", "PL-ft", "APL-ft"]
+ORDER = ["AL", "P-raw", "PL-raw", "APL-raw", "P-ft", "PL-ft", "APL-ft", "XLSR-CTC"]
 
 
 def main():
